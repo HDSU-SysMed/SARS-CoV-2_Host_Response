@@ -1,0 +1,144 @@
+############################
+## Author: Lukas Adam
+## Creation Date: 01/05/20
+## Snakemake File for bulk-
+##     RNA-Seq Analysis
+############################
+
+BASE_DIR = '/home/bq_ladam/RNASeqData_COVID_3rd_run/'
+ISILON_DIR = '/net/isilon/ag-niopek/ladam/SARS_COV_2_sequencing_run_3/'
+DATA_DIR = ISILON_DIR + 'delivery/SKA03/delivery/'
+REFERENCE_GENOME_DIR = '/home/bq_ladam/RNASeqData_COVID_2nd_run/ReferenceGenome/'
+ANNOTATION_DIR = '/home/bq_ladam/RNASeqData_COVID_2nd_run/Annotation/'
+
+WORK_DIR = BASE_DIR
+INTERMEDIATE_DIR = ISILON_DIR + 'Intermediates/'
+INDEX_DIR = '/home/bq_ladam/RNASeqData_COVID_2nd_run/CovidIndex/'
+
+STAR_PATH = '/home/bq_ladam/RNASeqData_COVID_2nd_run/STAR-2.6.0c/bin/Linux_x86_64_static/STAR'
+FEATURECOUNTS_PATH = '/home/bq_ladam/RNASeqData_COVID_2nd_run/subread/bin/featureCounts'
+
+##############################
+
+FILE_NAME = 'host_virus_comb'
+
+REFERENCE_FILE = REFERENCE_GENOME_DIR + FILE_NAME + '.fa'
+ANNOTATION_FILE = ANNOTATION_DIR + FILE_NAME + '.gff'
+ANNOTATION_GTF_HOST = ANNOTATION_DIR + 'GCF_000001405.39_GRCh38.p13_genomic.gtf'
+ANNOTATION_GTF_VIRUS = ANNOTATION_DIR + 'covid19.gtf'
+
+##############################
+
+SAMPLES_CONCAT, READS = glob_wildcards(DATA_DIR + '{sample}_{read}_001.fastq.gz')
+
+SAMPLES = list(set([sample.split('/')[0] for sample in SAMPLES_CONCAT]))
+
+print(SAMPLES)
+
+##############################
+
+
+rule allout:
+        input:
+            INDEX_DIR,
+            expand(DATA_DIR + '{sample}/{sample}_R1_001.fastq.gz', sample=SAMPLES),
+            expand(DATA_DIR + '{sample}/{sample}_R2_001.fastq.gz', sample=SAMPLES),
+            expand(INTERMEDIATE_DIR + 'star/{sample}/Aligned.sortedByCoord.out.bam', sample=SAMPLES),
+            expand(INTERMEDIATE_DIR + 'star/{sample}/host.sam', sample=SAMPLES),
+            expand(INTERMEDIATE_DIR + 'star/{sample}/virus.bam', sample=SAMPLES),
+            expand(WORK_DIR + 'Final/counts/counts_matrix_host.csv'),
+            expand(WORK_DIR + 'Final/counts/counts_matrix_virus.csv')
+
+##############################
+
+rule index:
+        input:
+            fa = REFERENCE_FILE, # provide your reference FASTA file
+            gtf = ANNOTATION_FILE # provide your GTF file
+        params:
+            star = STAR_PATH
+        output:
+            INDEX_DIR
+        threads: 20 # set the maximum number of available cores
+        shell:
+            'mkdir -p {output} && '
+            '{params.star} --runThreadN {threads} '
+            '--runMode genomeGenerate '
+            '--genomeDir {output} '
+            '--genomeFastaFiles {input.fa} '
+            '--sjdbGTFfile {input.gtf} '
+            '--sjdbOverhang 100'
+
+##############################
+
+rule star:
+        input:
+            r1 = DATA_DIR + '{sample}/{sample}_R1_001.fastq.gz', 
+            r2 = DATA_DIR + '{sample}/{sample}_R2_001.fastq.gz', 
+            refdir = INDEX_DIR
+        params:
+            star = STAR_PATH,
+            outdir = INTERMEDIATE_DIR + 'star/{sample}'
+        output:
+            INTERMEDIATE_DIR + 'star/{sample}/Aligned.sortedByCoord.out.bam'
+        threads: 20 # set the maximum number of available cores
+        shell:
+            'mkdir -p {params.outdir} && '
+            'cd {params.outdir} && '
+            '{params.star} --runThreadN {threads} '
+            '--genomeDir {input.refdir} '
+            '--readFilesCommand gunzip -c '
+            '--readFilesIn {input.r1} {input.r2} '
+            '--outSAMtype BAM SortedByCoordinate '
+            '--quantMode GeneCounts '
+            '--limitBAMsortRAM 51166447416 '
+
+##############################
+
+rule sam_merge:
+        input:
+            bam = INTERMEDIATE_DIR + 'star/{sample}/Aligned.sortedByCoord.out.bam' 
+        output:
+            host_sam = INTERMEDIATE_DIR + 'star/{sample}/host.sam',
+            virus_bam = INTERMEDIATE_DIR + 'star/{sample}/virus.bam' 
+        shell:
+            'samtools index {input.bam} && ' 
+	    'samtools view -b {input.bam} "NC_045512.2" > {output.virus_bam} && ' 
+            'samtools view -b -h {input.bam} | awk "{{if(\$3 != \"NC_045512.2\"){{print \$0}}}}" > {output.host_sam}'
+
+#############################
+
+rule featureCounts_host:
+        input:
+            bams = [
+            (INTERMEDIATE_DIR + 'star/{sample}/host.sam').format(sample=sample) for sample in SAMPLES
+            ]
+        params:
+            gtf = ANNOTATION_GTF_VIRUS, # provide your GTF file
+            outdir = WORK_DIR + 'Final/counts/',
+	    featureCounts = FEATURECOUNTS_PATH
+        output:
+            counts = WORK_DIR + 'Final/counts/counts_host.txt',
+            counts_matrix = WORK_DIR + 'Final/counts/counts_matrix_host.csv'
+        shell:
+            'mkdir -p {params.outdir} && '
+            '{params.featureCounts} -T 5 -t exon -g gene_name -a {params.gtf} -o {output.counts} {input.bams} && '
+            'cat {output.counts} | cut -f1,7- | sed 1d > {output.counts_matrix}'
+
+rule featureCounts_virus:
+        input:
+            bams = [
+            (INTERMEDIATE_DIR + 'star/{sample}/virus.bam').format(sample=sample) for sample in SAMPLES
+            ]
+        params:
+            gtf = ANNOTATION_GTF_VIRUS, # provide your GTF file
+            outdir = WORK_DIR + 'Final/counts/',
+	    featureCounts = FEATURECOUNTS_PATH
+        output:
+            counts = WORK_DIR + 'Final/counts/counts_virus.txt',
+            counts_matrix = WORK_DIR + 'Final/counts/counts_matrix_virus.csv'
+        shell:
+            'mkdir -p {params.outdir} && '
+            '{params.featureCounts} -T 3 -t CDS -g gene_name -a {params.gtf} -o {output.counts} {input.bams} && '
+            'cat {output.counts} | cut -f1,7- | sed 1d > {output.counts_matrix}'
+
